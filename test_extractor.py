@@ -1,408 +1,318 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import re
+"""
+Extrae preguntas/opciones del test anónimo del Club del Árbitro, y deduce
+la respuesta correcta de TODAS las preguntas incluso si el HTML de resultados
+no la muestra (porque acertaste en el envío base).
+
+NOVEDAD: El CSV conserva TODAS las opciones del original.
+- El encabezado añade columnas A, B, C, ... hasta el número máximo de opciones
+  que haya en alguna pregunta.
+- Cada fila coloca las opciones de esa pregunta y deja vacío si tiene menos.
+
+Estrategia:
+  1) Envío base: todo "A" -> score_base.
+  2) Parsear "Respuesta correcta" de las falladas.
+  3) Para las restantes, sondeo por puntuación: variar UNA pregunta cada vez
+     probando B, C, ...; si la puntuación sube, esa opción es la correcta.
+     Si nunca sube, A era la correcta.
+
+Salida: CSV/JSON con "correcta" (letra) y "correcta_texto".
+"""
+
+import argparse
 import csv
 import json
-import html
-import argparse
-import unicodedata
-from difflib import SequenceMatcher
-from pathlib import Path
-
+import re
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
 import requests
-from bs4 import BeautifulSoup, Tag, NavigableString
+from bs4 import BeautifulSoup
 
-BASE         = "https://www.clubdelarbitro.com/"
-CONFIG_URL   = "https://www.clubdelarbitro.com/Tests/configurarTestAnonimo.php?ins=0&pub=1"
-ACTION_URL   = "https://www.clubdelarbitro.com/Tests/mostrarTestAnonimo.php?ins=0"
-GRADE_URL    = "https://www.clubdelarbitro.com/Tests/testAnonimo2.php?ins=0"
+BASE = "https://www.clubdelarbitro.com/Tests"
+CONFIG_URL = f"{BASE}/configurarTestAnonimo.php?ins=0&pub=1"
+ACTION_URL = f"{BASE}/mostrarTestAnonimo.php?ins=0"   # página que genera el test y a la que se hace POST inicial
+GRADE_URL  = f"{BASE}/testAnonimo2.php?ins=0"         # página de corrección
 
 HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
+    "User-Agent": "Mozilla/5.0 (compatible; TestExtractor/1.1)",
+    "Referer": CONFIG_URL
 }
 
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# Generador de letras A..Z (y más si hiciera falta)
+def letter(i: int) -> str:
+    # A, B, C... Z, AA, AB... por si existieran >26 (poco probable)
+    s = ""
+    i0 = i
+    i += 1
+    while i > 0:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
+@dataclass
+class Pregunta:
+    idx: int
+    id_pregunta: str
+    pregunta: str
+    opciones_val: List[str]      # value del radio en el form
+    opciones_texto: List[str]    # texto visible de cada opción
+    correcta_letra: str = ""     # A/B/C...
+    correcta_texto: str = ""     # texto literal de la opción correcta
 
 # -------------------- HTTP helpers --------------------
 
-def http_get(s: requests.Session, url: str, referer: str | None = None):
-    h = HEADERS.copy()
-    if referer: h["Referer"] = referer
-    r = s.get(url, headers=h, timeout=25, allow_redirects=True)
+def http_get(session: requests.Session, url: str) -> requests.Response:
+    r = session.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return r
 
-def http_post(s: requests.Session, url: str, data: dict, referer: str | None = None):
+def http_post(session: requests.Session, url: str, data: dict, referer: str) -> requests.Response:
     h = HEADERS.copy()
-    if referer: h["Referer"] = referer
-    r = s.post(url, headers=h, data=data, timeout=25, allow_redirects=True)
+    h["Referer"] = referer
+    r = session.post(url, headers=h, data=data, timeout=20)
     r.raise_for_status()
     return r
 
-def decode_response(resp: requests.Response) -> str:
+def decode_response(r: requests.Response) -> str:
+    # Devolver .text según lo detectado por requests/servidor (no forzamos re-codificación)
+    return r.text
+
+# -------------------- Parsing --------------------
+
+def parse_test_html(html: str) -> Tuple[List[Pregunta], Dict[int, str]]:
     """
-    Devuelve el HTML decodificado con el charset correcto.
-    Si detecta ISO-8859-1 en meta o cabeceras, fuerza esa decodificación.
+    Parsea el HTML del test (mostrarTestAnonimo.php) y devuelve:
+      - lista de Pregunta (con idx, id, enunciado, opciones val/texto)
+      - map idx -> 'opcion{idx}'
     """
-    raw = resp.content  # bytes
-    ctype = (resp.headers.get("content-type") or "").lower()
-    head = raw[:2048].decode("ascii", errors="ignore").lower()
+    soup = BeautifulSoup(html, "html.parser")
 
-    enc = None
-    # meta charset
-    m = re.search(r'charset\s*=\s*([a-z0-9_\-]+)', head)
-    if m:
-        enc = m.group(1).strip()
-    # header
-    if not enc:
-        m2 = re.search(r'charset\s*=\s*([a-z0-9_\-]+)', ctype)
-        if m2:
-            enc = m2.group(1).strip()
-    # fallback
-    if not enc:
-        enc = resp.apparent_encoding or resp.encoding or "utf-8"
+    preguntas: List[Pregunta] = []
+    idx_to_name: Dict[int, str] = {}
 
-    if enc.lower() in ("iso-8859-1", "latin-1", "latin1", "iso8859-1"):
-        enc = "iso-8859-1"
-
-    try:
-        return raw.decode(enc, errors="replace")
-    except LookupError:
-        return raw.decode("utf-8", errors="replace")
-
-def save_debug(html_str: str, path: str, print_first=False, print_full=False, label="HTML"):
-    Path(path).write_text(html_str, encoding="utf-8")
-    print(f"[DEBUG] {label} guardado en: {path} ({len(html_str)} bytes)")
-    if print_full:
-        print("\n-----", label, "COMPLETO -----\n", html_str, "\n----- FIN -----\n")
-    elif print_first:
-        snippet = re.sub(r"\s+", " ", html_str[:1200]).strip()
-        print(f"[DEBUG] {label} (primeros 1200 chars): {snippet}")
-
-
-# -------------------- Normalización / matching (para comparar) --------------------
-
-def normalize_txt_strict(s: str) -> str:
-    if s is None:
-        return ""
-    # Decodifica entidades para comparar mejor
-    s = html.unescape(s)
-    # Normaliza comillas
-    s = (s.replace("“", '"').replace("”", '"')
-           .replace("’", "'").replace("‘", "'"))
-    s = s.replace('""""', '"').replace('"""', '"').replace("''", "'")
-    # Quita referencias finales (ART, IO, RJ, etc.)
-    s = re.sub(
-        r"\s*\((art|arts?|art[íi]culo|ejemplo|io|rj|situaci[oó]n|sit|v[0-9._-]+)[^)]+\)\s*$",
-        "", s, flags=re.I
-    )
-    # Quita diacríticos SOLO para comparar
-    s = ''.join(c for c in unicodedata.normalize('NFD', s)
-                if unicodedata.category(c) != 'Mn')
-    s = s.lower()
-    s = s.strip().rstrip(".;:¡!¿?[]()")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def best_option_match(correct_text: str, opciones_texto: list[str]) -> int:
-    target = normalize_txt_strict(correct_text)
-    opts_norm = [normalize_txt_strict(x) for x in opciones_texto]
-
-    # exacto
-    for i, o in enumerate(opts_norm):
-        if o == target:
-            return i
-    # inclusión
-    for i, o in enumerate(opts_norm):
-        if o and (o in target or target in o):
-            return i
-    # fuzzy
-    best_i, best_r = -1, -1.0
-    for i, o in enumerate(opts_norm):
-        r = SequenceMatcher(None, o, target).ratio()
-        if r > best_r:
-            best_r, best_i = r, i
-    if best_r >= 0.80:
-        return best_i
-    return best_i
-
-
-# -------------------- Limpieza para SALIDA visible --------------------
-
-def clean_visible_text(s: str) -> str:
-    """Limpieza ligera para SALIDA (conserva tildes)."""
-    s = html.unescape(s)  # entidades → caracteres reales con tildes
-    s = s.replace('""""', '"').replace('"""', '"').replace("''", "'")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-# -------------------- Parseo del TEST --------------------
-
-def parse_test_form(test_html: str):
-    """
-    Returns:
-      preguntas: list of dicts {idx, id_pregunta, pregunta, opciones_texto(list[str])}
-      id_map:    {idx -> hidden id value}
-      opciones_map: {idx -> list of (value, texto)}
-    """
-    soup = BeautifulSoup(test_html, "html.parser")
-
-    # Form que postea a testAnonimo2.php
-    form = None
-    for f in soup.find_all("form"):
-        act = (f.get("action") or "").lower()
-        if "testanonimo2.php" in act:
-            form = f
-            break
-    if form is None:
-        forms = soup.find_all("form")
-        if not forms:
-            return [], {}, {}
-        form = max(forms, key=lambda x: len(x.get_text()))
-
-    # Índices por hidden id{i}
-    hidden_ids = form.find_all("input", attrs={"type": "hidden", "name": re.compile(r"^id\d+$")})
-    indices, id_map = [], {}
-    for hid in hidden_ids:
-        m = re.match(r"id(\d+)$", hid.get("name",""))
-        if m:
-            i = int(m.group(1))
-            indices.append(i)
-            id_map[i] = hid.get("value", "")
-    indices = sorted(set(indices))
-
-    preguntas, opciones_map = [], {}
-    for i in indices:
-        hid = form.find("input", attrs={"type": "hidden", "name": f"id{i}"})
-        cont = hid.find_parent("td") if hid else form
-
-        # Pregunta
-        qtxt = ""
-        btag = cont.find("b")
-        if btag and btag.get_text(strip=True):
-            qtxt = clean_visible_text(btag.get_text(" ", strip=True))
-        else:
-            raw = clean_visible_text(cont.get_text(" ", strip=True))
-            qtxt = raw.split("?")[0] + "?" if "?" in raw else raw[:200]
-        qtxt = re.sub(r"^\s*\d+\)\s*", "", qtxt).strip()
-
-        # Opciones (en orden A,B,C,…)
-        opciones = []
-        for inp in cont.find_all("input", attrs={"type": "radio", "name": f"opcion{i}"}):
-            val = inp.get("value", "")
-            txt = ""
-            sib = inp.next_sibling
-            steps = 0
-            while sib and steps < 8:
-                steps += 1
-                if isinstance(sib, NavigableString):
-                    if str(sib).strip():
-                        txt = str(sib).strip()
-                        break
-                elif isinstance(sib, Tag):
-                    cand = sib.get_text(" ", strip=True)
-                    if cand:
-                        txt = cand
-                        break
-                sib = sib.next_sibling
-            if not txt and isinstance(inp.next_sibling, str):
-                txt = inp.next_sibling.strip()
-            txt = clean_visible_text(txt)
-            if val and txt:
-                opciones.append((val, txt))
-
-        opciones_map[i] = opciones
-        preguntas.append({
-            "idx": i,
-            "id_pregunta": id_map.get(i, ""),
-            "pregunta": qtxt,
-            "opciones_texto": [t for _, t in opciones],
-        })
-
-    return preguntas, id_map, opciones_map
-
-
-# -------------------- Enviar "todo A" y leer RESULTADOS --------------------
-
-def build_all_A_payload(id_map: dict, opciones_map: dict, tipo: str, preguntas_n: str):
-    data = {"tipo": tipo, "preguntas": preguntas_n, "enviar": "Corregir test"}
-    for i, pid in id_map.items():
-        data[f"id{i}"] = pid
-    for i, opts in opciones_map.items():
-        if opts:
-            data[f"opcion{i}"] = opts[0][0]  # primera opción = "A"
-    return data
-
-def parse_correct_answers_from_results(result_html: str):
-    """
-    Extrae el texto del <i> que sigue a 'Respuesta correcta:' para cada pregunta.
-    Devuelve la lista en el orden de aparición. (Texto con tildes correcto.)
-    """
-    def _norm_out(s: str) -> str:
-        s = html.unescape(s)
-        s = s.replace('""""', '"').replace('"""', '"').replace("''", "'")
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    soup = BeautifulSoup(result_html, "html.parser")
-    correct_texts = []
-
-    # Buscar <u> con "Respuesta correcta" y tomar el siguiente <i>
-    for u in soup.find_all("u"):
-        label = _norm_out(u.get_text(" ", strip=True)).lower()
-        if "respuesta correcta" not in label:
+    trs = soup.select("table table form tr")
+    for tr in trs:
+        hid = tr.find("input", {"type": "hidden", "name": re.compile(r"^id\d+$")})
+        if not hid:
             continue
 
-        nxt = u
-        i_tag = None
-        for _ in range(12):
-            nxt = nxt.next_sibling if hasattr(nxt, "next_sibling") else None
-            if nxt is None:
-                break
-            if isinstance(nxt, Tag):
-                if nxt.name == "i":
-                    i_tag = nxt
+        m = re.match(r"^id(\d+)$", hid["name"])
+        if not m:
+            continue
+        idx = int(m.group(1))
+        id_pregunta = (hid.get("value") or "").strip()
+
+        # Enunciado visible
+        b = tr.find("b")
+        enunciado = b.get_text(" ", strip=True) if b else ""
+
+        # Opciones
+        radios = tr.find_all("input", {"type": "radio", "name": f"opcion{idx}"})
+        opciones_val, opciones_texto = [], []
+        for r in radios:
+            val = (r.get("value") or "").strip()
+            # texto de la opción: concatenar hasta el <br>
+            txt_parts = []
+            for sib in r.next_siblings:
+                if getattr(sib, "name", None) == "br":
                     break
-                found = nxt.find("i")
-                if isinstance(found, Tag):
-                    i_tag = found
-                    break
+                if hasattr(sib, "get_text"):
+                    txt_parts.append(sib.get_text(" ", strip=True))
+                else:
+                    txt_parts.append(str(sib).strip())
+            txt = " ".join(p for p in txt_parts if p).strip()
+            txt = re.sub(r"\s+", " ", txt)
+            opciones_val.append(val)
+            opciones_texto.append(txt)
 
-        if i_tag is None:
-            found = u.find_next("i")
-            if isinstance(found, Tag):
-                i_tag = found
+        preguntas.append(Pregunta(
+            idx=idx,
+            id_pregunta=id_pregunta,
+            pregunta=enunciado,
+            opciones_val=opciones_val,
+            opciones_texto=opciones_texto
+        ))
+        idx_to_name[idx] = f"opcion{idx}"
 
-        if i_tag is not None:
-            txt = _norm_out(i_tag.get_text(" ", strip=True))
-            if txt:
-                correct_texts.append(txt)
+    return preguntas, idx_to_name
 
-    # Respaldo por regex
-    if not correct_texts:
-        pattern = re.compile(r"Respuesta\s*correcta\s*:.*?<i>(.*?)</i>", re.I | re.S)
-        correct_texts = [_norm_out(m.group(1)) for m in pattern.finditer(result_html)]
+def parse_correct_from_results(html: str) -> Dict[int, str]:
+    """
+    Extrae {idx -> texto_correcto} del HTML de resultados.
+    OJO: solo aparece en preguntas FALLADAS en ese envío.
+    """
+    out: Dict[int, str] = {}
+    soup = BeautifulSoup(html, "html.parser")
 
-    return correct_texts
+    for b in soup.find_all("b"):
+        t = b.get_text(" ", strip=True)
+        m = re.match(r"(\d+)\)", t)
+        if not m:
+            continue
+        idx_humano = int(m.group(1))
+        idx = idx_humano - 1
 
+        u = b.find_next("u", string=re.compile(r"Respuesta correcta", re.I))
+        if not u:
+            continue
+        i = u.find_next("i")
+        if not i:
+            continue
+        corr = i.get_text(" ", strip=True)
+        # eliminar trailing "(ART...)" o similares
+        corr = re.sub(r"\s*\(.*?\)\s*$", "", corr).strip()
+        out[idx] = corr
+    return out
 
-# -------------------- Export (CSV / JSON) --------------------
+def parse_score_from_results(html: str) -> int | None:
+    m = re.search(r"Tienes\s+(\d+)\s+aciertos\s+sobre\s+(\d+)", html, re.I)
+    return int(m.group(1)) if m else None
 
-def to_letter(idx0: int) -> str:
-    return LETTERS[idx0] if 0 <= idx0 < len(LETTERS) else ""
+# -------------------- Payload builders --------------------
 
-def write_csv_with_correct(preguntas, correcta_letras: dict, path: str, encoding: str = "utf-8-sig"):
-    # UTF-8 con BOM por defecto (ideal para Excel)
-    max_ops = max((len(p["opciones_texto"]) for p in preguntas), default=0)
-    fieldnames = ["id_pregunta", "pregunta"] + [f"opcion_{k}" for k in range(1, max_ops+1)] + ["correcta"]
-
-    with open(path, "w", encoding=encoding, newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for p in preguntas:
-            row = {
-                "id_pregunta": p["id_pregunta"],
-                "pregunta": p["pregunta"],
-                "correcta": correcta_letras.get(p["idx"], ""),
-            }
-            for k, txt in enumerate(p["opciones_texto"], start=1):
-                row[f"opcion_{k}"] = txt
-            w.writerow(row)
-    print(f"[OK] CSV creado: {path} (encoding={encoding}, preguntas: {len(preguntas)})")
-
-def write_json_with_correct(preguntas, correcta_letras: dict, correcta_textos: dict, path: str,
-                            encoding: str = "utf-8"):
-    data = []
+def build_payload_with_choice(preguntas: List[Pregunta],
+                              base_choice_idx: int,
+                              override_idx: int,
+                              override_pos: int,
+                              tipo: str,
+                              preguntas_n: int) -> dict:
+    """
+    Todas con 'base_choice_idx' (0=A), salvo la pregunta 'override_idx' que
+    toma 'override_pos'.
+    """
+    data = {"tipo": tipo, "preguntas": str(preguntas_n), "enviar": "Corregir test"}
     for p in preguntas:
-        idx = p["idx"]
-        data.append({
-            "id_pregunta": p["id_pregunta"],
-            "pregunta": p["pregunta"],
-            "opciones": p["opciones_texto"],
-            "correcta": correcta_letras.get(idx, ""),
-            "correcta_texto": correcta_textos.get(idx, "")
-        })
-    with open(path, "w", encoding=encoding) as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"[OK] JSON creado: {path} (encoding={encoding}, preguntas: {len(data)})")
+        data[f"id{p.idx}"] = p.id_pregunta
+        pos = base_choice_idx
+        if p.idx == override_idx:
+            pos = override_pos
+        pos = max(0, min(pos, len(p.opciones_val) - 1))
+        data[f"opcion{p.idx}"] = p.opciones_val[pos]
+    return data
 
-
-# -------------------- Main --------------------
+# -------------------- Main logic --------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Extrae preguntas/opciones y la RESPUESTA CORRECTA (CSV/JSON) con tildes OK.")
-    ap.add_argument("--tipo", choices=["testArb", "testOf"], default="testArb")
-    ap.add_argument("--preguntas", choices=["1", "5", "10", "25"], default="25")
-    ap.add_argument("--format", choices=["csv", "json", "both"], default="csv", help="Formato de salida.")
-    ap.add_argument("--output-base", default="test_con_correcta", help="Nombre base sin extensión.")
-    ap.add_argument("--csv-encoding", default="utf-8-sig", choices=["utf-8-sig","utf-8","latin-1"],
-                    help="Codificación del CSV (utf-8-sig recomendado para Excel).")
-    ap.add_argument("--json-encoding", default="utf-8", choices=["utf-8","latin-1"],
-                    help="Codificación del JSON (UTF-8 estándar).")
-    ap.add_argument("--test-html", default="debug_test.html")
-    ap.add_argument("--result-html", default="debug_resultados.html")
-    ap.add_argument("--print-test-html", action="store_true")
-    ap.add_argument("--print-result-html", action="store_true")
-    ap.add_argument("--peek", action="store_true", help="Imprime primeros 1200 chars de los HTML")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tipo", default="testArb", help="testArb/testOf")
+    ap.add_argument("--preguntas", type=int, default=25, help="Número de preguntas (1/5/10/25)")
+    ap.add_argument("--export-csv", help="Ruta CSV de salida")
+    ap.add_argument("--export-json", help="Ruta JSON de salida")
+    ap.add_argument("--sleep", type=float, default=0.3, help="Retardo entre peticiones (seg)")
     args = ap.parse_args()
 
-    with requests.Session() as s:
-        # 1) Primer GET (cookies)
-        r0 = http_get(s, CONFIG_URL, referer=BASE)
-        _ = decode_response(r0)  # no usado, pero útil si quieres depurar
+    s = requests.Session()
 
-        # 2) Generar test
-        r1 = http_post(s, ACTION_URL,
-                       data={"tipo": args.tipo, "preguntas": args.preguntas},
-                       referer=CONFIG_URL)
-        test_html = decode_response(r1)
-        save_debug(test_html, args.test_html, print_first=args.peek, print_full=args.print_test_html, label="TEST")
+    # 1) Cargar página de configuración
+    http_get(s, CONFIG_URL)
 
-        # 3) Parsear preguntas/opciones
-        preguntas, id_map, opciones_map = parse_test_form(test_html)
-        if not preguntas:
-            print("[WARN] No se detectaron preguntas en el test. Revisa debug_test.html")
-            return
-        print(f"[INFO] Preguntas detectadas: {len(preguntas)}")
+    # 2) Generar test del tipo/preguntas
+    cfg_payload = {"tipo": args.tipo, "preguntas": str(args.preguntas)}
+    r = http_post(s, ACTION_URL, data=cfg_payload, referer=CONFIG_URL)
+    test_html = decode_response(r)
 
-        # 4) Enviar todo "A"
-        payload = build_all_A_payload(id_map, opciones_map, tipo=args.tipo, preguntas_n=args.preguntas)
-        r2 = http_post(s, GRADE_URL, data=payload, referer=ACTION_URL)
-        result_html = decode_response(r2)
-        save_debug(result_html, args.result_html, print_first=args.peek, print_full=args.print_result_html, label="RESULTADOS")
+    # 3) Parsear test
+    preguntas, _ = parse_test_html(test_html)
+    if not preguntas:
+        raise RuntimeError("No se detectaron preguntas en el HTML del test.")
 
-        # 5) Extraer "Respuesta correcta:"
-        correct_texts = parse_correct_answers_from_results(result_html)
-        while len(correct_texts) < len(preguntas):
-            correct_texts.append("")
+    # 4) Envío base: todo A (pos 0)
+    base_payload = build_payload_with_choice(
+        preguntas=preguntas,
+        base_choice_idx=0,
+        override_idx=-1,
+        override_pos=0,
+        tipo=args.tipo,
+        preguntas_n=args.preguntas
+    )
+    r_res = http_post(s, GRADE_URL, data=base_payload, referer=ACTION_URL)
+    res_html = decode_response(r_res)
+    score_base = parse_score_from_results(res_html)
+    if score_base is None:
+        raise RuntimeError("No pude leer el marcador base en resultados.")
 
-        # 6) Mapear texto correcto → letra según opciones del test
-        correcta_letras, correcta_textos = {}, {}
-        for p, correct_txt in zip(preguntas, correct_texts):
-            if not correct_txt:
-                correcta_letras[p["idx"]] = ""
-                correcta_textos[p["idx"]] = ""
-                continue
-            pos = best_option_match(correct_txt, p["opciones_texto"])
-            correcta_letras[p["idx"]] = LETTERS[pos] if 0 <= pos < len(LETTERS) else ""
-            correcta_textos[p["idx"]] = p["opciones_texto"][pos] if 0 <= pos < len(p["opciones_texto"]) else ""
+    # 5) Correctas que el HTML imprime (solo falladas)
+    correct_texts = parse_correct_from_results(res_html)  # {idx -> texto_correcto}
 
-        # 7) Exportar
-        out_base = Path(args.output_base)
-        if args.format in ("csv", "both"):
-            write_csv_with_correct(preguntas, correcta_letras, str(out_base.with_suffix(".csv")),
-                                   encoding=args.csv_encoding)
-        if args.format in ("json", "both"):
-            write_json_with_correct(preguntas, correcta_letras, correcta_textos, str(out_base.with_suffix(".json")),
-                                    encoding=args.json_encoding)
+    # 6) Deducción por puntuación para las que faltan
+    for p in preguntas:
+        if p.idx in correct_texts:
+            continue  # ya conocida
+        best_pos = 0
+        best_score = score_base
+        for pos in range(1, len(p.opciones_val)):
+            payload = build_payload_with_choice(
+                preguntas=preguntas,
+                base_choice_idx=0,
+                override_idx=p.idx,
+                override_pos=pos,
+                tipo=args.tipo,
+                preguntas_n=args.preguntas
+            )
+            r_try = http_post(s, GRADE_URL, data=payload, referer=ACTION_URL)
+            html_try = decode_response(r_try)
+            sc = parse_score_from_results(html_try)
+            if sc is not None and sc > best_score:
+                best_score = sc
+                best_pos = pos
+            time.sleep(args.sleep)
+        correct_texts[p.idx] = p.opciones_texto[best_pos]
+
+    # 7) Completar letra/texto correcto en estructura Pregunta
+    for p in preguntas:
+        # localizar posición correcta por texto (exacto o con trim)
+        try:
+            pos = p.opciones_texto.index(correct_texts[p.idx])
+        except ValueError:
+            pos = next((i for i, t in enumerate(p.opciones_texto)
+                        if t.strip() == correct_texts[p.idx].strip()), 0)
+        p.correcta_letra = letter(pos)
+        p.correcta_texto = p.opciones_texto[pos]
+
+    # 8) Exportar
+    # 8.1 JSON (ya conserva todas las opciones)
+    if args.export_json:
+        out = []
+        for p in preguntas:
+            out.append({
+                "idx": p.idx,
+                "id_pregunta": p.id_pregunta,
+                "pregunta": p.pregunta,
+                "opciones": p.opciones_texto,
+                "correcta": p.correcta_letra,
+                "correcta_texto": p.correcta_texto,
+            })
+        with open(args.export_json, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print(f"[OK] JSON exportado: {args.export_json}")
+
+    # 8.2 CSV DINÁMICO (todas las opciones)
+    if args.export_csv:
+        max_opts = max(len(p.opciones_texto) for p in preguntas)
+        header = ["idx", "id_pregunta", "pregunta"]
+        header += [letter(i) for i in range(max_opts)]  # A.. hasta max
+        header += ["correcta", "correcta_texto"]
+        with open(args.export_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for p in preguntas:
+                row = [p.idx, p.id_pregunta, p.pregunta]
+                row += p.opciones_texto + [""] * (max_opts - len(p.opciones_texto))
+                row += [p.correcta_letra, p.correcta_texto]
+                w.writerow(row)
+        print(f"[OK] CSV exportado: {args.export_csv}")
+
+    # Sin export: salida legible en consola
+    if not args.export_csv and not args.export_json:
+        for p in preguntas:
+            print(f"{p.idx+1:02d}) {p.pregunta}")
+            for i, t in enumerate(p.opciones_texto):
+                flag = "*" if letter(i) == p.correcta_letra else " "
+                print(f"   {flag} {letter(i)}. {t}")
+            print()
 
 if __name__ == "__main__":
     main()
