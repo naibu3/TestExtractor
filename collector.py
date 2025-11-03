@@ -94,8 +94,7 @@ def format_question_like_original(p: dict, ordinal: int) -> str:
     options = _normalize_options(p.get("opciones") or p.get("opciones_texto") or p.get("answers") or p.get("respuestas"))
     if options:
         for i, (letter, text) in enumerate(options):
-            bullet = "* " if i == 0 else "  "
-            lines.append(f"   {bullet}{letter}. {text}")
+            lines.append(f"   {letter}. {text}")
     return "\n".join(lines)
 
 def print_questions_block(questions: List[dict], start_ordinal: int = 1):
@@ -125,7 +124,7 @@ def merge_into_map(existing_map: Dict[str, dict], extracted_list: List[dict]) ->
     return len(new_items), len(existing_map), new_items
 
 # ---------- invocación extractor ----------
-def run_extractor(extractor_path: str, preguntas: int, tipo: str = "testArb", tmp_out: str = None, sleep_between: float = 0.3):
+def run_extractor(extractor_path: str, preguntas: int, tipo: str = "testArb", tmp_out: str = "", sleep_between: float = 0.3):
     """
     Ejecuta test_extractor.py y genera un JSON temporal.
     Devuelve (lista_preguntas or None, tmp_out, proc)

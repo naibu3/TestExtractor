@@ -31,6 +31,10 @@ from typing import List, Dict, Tuple
 import requests
 from bs4 import BeautifulSoup
 
+import html
+
+
+
 BASE = "https://www.clubdelarbitro.com/Tests"
 CONFIG_URL = f"{BASE}/configurarTestAnonimo.php?ins=0&pub=1"
 ACTION_URL = f"{BASE}/mostrarTestAnonimo.php?ins=0"   # página que genera el test y a la que se hace POST inicial
@@ -40,6 +44,14 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; TestExtractor/1.1)",
     "Referer": CONFIG_URL
 }
+
+
+def norm_for_match(s: str) -> str:
+    if s is None:
+        return ""
+    s = html.unescape(s)             # convierte &aacute; -> á, etc.
+    s = re.sub(r"\s+", " ", s)       # colapsa espacios
+    return s.strip().lower()         # comparaciones insensibles a mayúsculas
 
 # Generador de letras A..Z (y más si hiciera falta)
 def letter(i: int) -> str:
@@ -263,14 +275,38 @@ def main():
 
     # 7) Completar letra/texto correcto en estructura Pregunta
     for p in preguntas:
-        # localizar posición correcta por texto (exacto o con trim)
-        try:
-            pos = p.opciones_texto.index(correct_texts[p.idx])
-        except ValueError:
-            pos = next((i for i, t in enumerate(p.opciones_texto)
-                        if t.strip() == correct_texts[p.idx].strip()), 0)
-        p.correcta_letra = letter(pos)
-        p.correcta_texto = p.opciones_texto[pos]
+        corr_raw = correct_texts.get(p.idx, "")
+        # Intento 1: match exacto por normalización robusta
+        pos = None
+        norm_corr = norm_for_match(corr_raw)
+        for i, opt in enumerate(p.opciones_texto):
+            if norm_for_match(opt) == norm_corr:
+                pos = i
+                break
+
+        # Intento 2 (opcional): beginswith/contains si hay pequeñas variaciones
+        if pos is None:
+            for i, opt in enumerate(p.opciones_texto):
+                no = norm_for_match(opt)
+                if no.startswith(norm_corr) or norm_corr.startswith(no):
+                    pos = i
+                    break
+
+        if pos is None:
+            # No se pudo mapear -> WARNING y NO forzar 'A'
+            print(f"[WARN] No se pudo mapear la respuesta correcta a una opción de la pregunta:")
+            print(f"       idx={p.idx} id={p.id_pregunta}")
+            print(f"       Pregunta: {p.pregunta}")
+            print(f"       Correcta (raspada): {corr_raw}")
+            print(f"       Opciones:")
+            for i, t in enumerate(p.opciones_texto):
+                print(f"         - {letter(i)}. {t}")
+            # Deja los campos vacíos para que CSV/JSON muestren el caso dudoso
+            p.correcta_letra = ""
+            p.correcta_texto = corr_raw or ""
+        else:
+            p.correcta_letra = letter(pos)
+            p.correcta_texto = p.opciones_texto[pos]
 
     # 8) Exportar
     # 8.1 JSON (ya conserva todas las opciones)
